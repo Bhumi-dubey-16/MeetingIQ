@@ -1,0 +1,12 @@
+.env
+__pycache__/
+*.pyc
+*.pyo
+temp_uploads/
+temp_outputs/
+*.pdf
+*.pptx
+.DS_Store
+venv/
+.venv/
+*.egg-info/
