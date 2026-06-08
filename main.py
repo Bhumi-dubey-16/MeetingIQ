@@ -1,27 +1,37 @@
 import os
 import uuid
 import shutil
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
 from fastapi.responses import FileResponse
 from typing import Optional
 from dotenv import load_dotenv
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
 from services.parser       import parse_input
 from services.email_sender import send_report, build_email_body
 from agent.runner          import run_agent
 from models.schemas        import FullReport, EmailRequest, StatusResponse
+from database              import init_db, save_report, get_report as db_get_report, get_recent_reports
 
 load_dotenv()
 
-app = FastAPI(title="MeetingIQ API", version="1.0.0")
+# ── Rate limiter ───────────────────────────────────────────────────────────────
+limiter = Limiter(key_func=get_remote_address)
+app     = FastAPI(title="MeetingIQ API", version="1.0.0")
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-reports_store     : dict[str, FullReport] = {}
-transcripts_store : dict[str, str]        = {}
+# ── Init database on startup ───────────────────────────────────────────────────
+# Creates the reports table if it doesn't exist yet.
+# Safe to call every time — won't overwrite existing data.
+init_db()
 
-UPLOAD_DIR = "temp_uploads"
 OUTPUT_DIR = "temp_outputs"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
+UPLOAD_DIR = "temp_uploads"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
 
 @app.get("/")
@@ -30,7 +40,9 @@ def root():
 
 
 @app.post("/analyse")
+@limiter.limit("5/minute")
 async def analyse(
+    request: Request,
     file: Optional[UploadFile] = File(None),
     text: Optional[str]        = Form(None)
 ):
@@ -45,15 +57,23 @@ async def analyse(
             with open(file_path, "wb") as f:
                 shutil.copyfileobj(file.file, f)
 
-        transcript = parse_input(file_path=file_path, text=text)
+        try:
+            transcript = parse_input(file_path=file_path, text=text)
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
 
         if not transcript or len(transcript.strip()) < 50:
-            raise HTTPException(status_code=400, detail="Transcript too short to analyse")
+            raise HTTPException(status_code=400, detail="Transcript too short to analyse — need at least 50 characters")
 
         report_id, report = run_agent(transcript)
 
-        reports_store[report_id]     = report
-        transcripts_store[report_id] = transcript
+        # ── Persist to database ────────────────────────────────────────────────
+        # Now survives server restarts — report_id stays valid forever
+        save_report(
+            report_id   = report_id,
+            transcript  = transcript,
+            report_dict = report.model_dump()
+        )
 
         return {
             "report_id"  : report_id,
@@ -67,23 +87,33 @@ async def analyse(
 
 
 @app.get("/report/{report_id}")
-def get_report(report_id: str):
-    if report_id not in reports_store:
+@limiter.limit("30/minute")
+def get_report(request: Request, report_id: str):
+    # Now reads from DB instead of in-memory dict
+    data = db_get_report(report_id)
+    if not data:
         raise HTTPException(status_code=404, detail="Report not found")
-    return {
-        "report_id"  : report_id,
-        "report"     : reports_store[report_id].model_dump(),
-        "transcript" : transcripts_store.get(report_id, "")
-    }
+    return data
+
+
+@app.get("/reports")
+@limiter.limit("20/minute")
+def list_reports(request: Request, limit: int = 20):
+    """Returns the most recent N reports — useful for a dashboard."""
+    return get_recent_reports(limit=limit)
 
 
 @app.get("/download/pdf/{report_id}")
-def download_pdf(report_id: str):
-    if report_id not in reports_store:
+@limiter.limit("10/minute")
+def download_pdf(request: Request, report_id: str):
+    data = db_get_report(report_id)
+    if not data:
         raise HTTPException(status_code=404, detail="Report not found")
 
     from services.pdf_generator import generate_pdf
-    report   = reports_store[report_id]
+    from models.schemas import FullReport
+
+    report   = FullReport(**data["report"])
     pdf_path = os.path.join(OUTPUT_DIR, f"{report_id}.pdf")
     generate_pdf(report, pdf_path)
 
@@ -95,12 +125,16 @@ def download_pdf(report_id: str):
 
 
 @app.get("/download/ppt/{report_id}")
-def download_ppt(report_id: str):
-    if report_id not in reports_store:
+@limiter.limit("10/minute")
+def download_ppt(request: Request, report_id: str):
+    data = db_get_report(report_id)
+    if not data:
         raise HTTPException(status_code=404, detail="Report not found")
 
     from services.ppt_generator import generate_ppt
-    report   = reports_store[report_id]
+    from models.schemas import FullReport
+
+    report   = FullReport(**data["report"])
     ppt_path = os.path.join(OUTPUT_DIR, f"{report_id}.pptx")
     generate_ppt(report, ppt_path)
 
@@ -111,27 +145,27 @@ def download_ppt(report_id: str):
     )
 
 
-# ── ENDPOINT 5 — Send email (PDF + PPT both attached) ─────────────────────────
 @app.post("/send-email", response_model=StatusResponse)
-def send_email(request: EmailRequest):
-    if request.report_id not in reports_store:
+@limiter.limit("3/minute")
+def send_email(request: Request, email_request: EmailRequest):
+    data = db_get_report(email_request.report_id)
+    if not data:
         raise HTTPException(status_code=404, detail="Report not found")
-
-    report = reports_store[request.report_id]
 
     from services.pdf_generator import generate_pdf
     from services.ppt_generator import generate_ppt
+    from models.schemas import FullReport
 
-    pdf_path = os.path.join(OUTPUT_DIR, f"{request.report_id}.pdf")
-    ppt_path = os.path.join(OUTPUT_DIR, f"{request.report_id}.pptx")
+    report   = FullReport(**data["report"])
+    pdf_path = os.path.join(OUTPUT_DIR, f"{email_request.report_id}.pdf")
+    ppt_path = os.path.join(OUTPUT_DIR, f"{email_request.report_id}.pptx")
 
     generate_pdf(report, pdf_path)
     generate_ppt(report, ppt_path)
 
-    body = build_email_body(report)
-
+    body   = build_email_body(report)
     result = send_report(
-        to_emails   = request.emails,
+        to_emails   = email_request.emails,
         subject     = f"Meeting Summary — {report.summary.meeting_type} | {report.summary.one_line[:60]}",
         body        = body,
         attachments = [pdf_path, ppt_path]
@@ -140,7 +174,7 @@ def send_email(request: EmailRequest):
     if result["success"]:
         return StatusResponse(
             status  = "success",
-            message = f"Report sent to {len(request.emails)} recipients with PDF + PPT attached"
+            message = f"Report sent to {len(email_request.emails)} recipients with PDF + PPT attached"
         )
     else:
         raise HTTPException(status_code=500, detail=result["error"])

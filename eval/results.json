@@ -1,0 +1,118 @@
+[
+  {
+    "id": "01_product_planning",
+    "passed": true,
+    "latency_s": 22.4,
+    "action_recall": 1.0,
+    "decision_recall": 1.0,
+    "type_correct": true,
+    "action_misses": [],
+    "decision_misses": [],
+    "error": null
+  },
+  {
+    "id": "02_sales_call",
+    "passed": true,
+    "latency_s": 23.75,
+    "action_recall": 1.0,
+    "decision_recall": 1.0,
+    "type_correct": true,
+    "action_misses": [],
+    "decision_misses": [],
+    "error": null
+  },
+  {
+    "id": "03_engineering_standup",
+    "passed": true,
+    "latency_s": 15.15,
+    "action_recall": 1.0,
+    "decision_recall": 1.0,
+    "type_correct": true,
+    "action_misses": [],
+    "decision_misses": [],
+    "error": null
+  },
+  {
+    "id": "04_hr_review",
+    "passed": true,
+    "latency_s": 16.8,
+    "action_recall": 1.0,
+    "decision_recall": 0.667,
+    "type_correct": true,
+    "action_misses": [],
+    "decision_misses": [
+      "january"
+    ],
+    "error": null
+  },
+  {
+    "id": "05_investor_update",
+    "passed": false,
+    "latency_s": 16.15,
+    "action_recall": 1.0,
+    "decision_recall": 1.0,
+    "type_correct": false,
+    "action_misses": [],
+    "decision_misses": [],
+    "error": null
+  },
+  {
+    "id": "06_vendor_negotiation",
+    "passed": true,
+    "latency_s": 21.84,
+    "action_recall": 1.0,
+    "decision_recall": 0.667,
+    "type_correct": true,
+    "action_misses": [],
+    "decision_misses": [
+      "4,500"
+    ],
+    "error": null
+  },
+  {
+    "id": "07_sprint_retro",
+    "passed": true,
+    "latency_s": 16.32,
+    "action_recall": 1.0,
+    "decision_recall": 0.667,
+    "type_correct": true,
+    "action_misses": [],
+    "decision_misses": [
+      "scope"
+    ],
+    "error": null
+  },
+  {
+    "id": "08_client_onboarding",
+    "passed": true,
+    "latency_s": 24.55,
+    "action_recall": 1.0,
+    "decision_recall": 1.0,
+    "type_correct": true,
+    "action_misses": [],
+    "decision_misses": [],
+    "error": null
+  },
+  {
+    "id": "09_budget_review",
+    "passed": true,
+    "latency_s": 18.62,
+    "action_recall": 1.0,
+    "decision_recall": 1.0,
+    "type_correct": true,
+    "action_misses": [],
+    "decision_misses": [],
+    "error": null
+  },
+  {
+    "id": "10_incident_response",
+    "passed": true,
+    "latency_s": 24.99,
+    "action_recall": 1.0,
+    "decision_recall": 1.0,
+    "type_correct": true,
+    "action_misses": [],
+    "decision_misses": [],
+    "error": null
+  }
+]

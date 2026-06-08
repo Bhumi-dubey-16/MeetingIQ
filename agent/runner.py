@@ -1,4 +1,6 @@
 import uuid
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from agent.tools import (
     extract_core_summary,
     extract_action_items,
@@ -10,45 +12,125 @@ from agent.tools import (
     extract_dates,
     extract_risks
 )
-from models.schemas import FullReport
+from models.schemas import FullReport, CoreSummary, Decision
+
+_executor = ThreadPoolExecutor(max_workers=9)
 
 
-def run_agent(transcript: str) -> tuple[str, FullReport]:
+def _run_in_thread(func, transcript: str):
+    """Wraps a blocking function so asyncio can run it without freezing."""
+    loop = asyncio.get_event_loop()
+    return loop.run_in_executor(_executor, func, transcript)
+
+
+def _fallback_summary(transcript: str) -> CoreSummary:
     """
-    Runs all 9 tools on the transcript sequentially.
-    Returns (report_id, FullReport)
+    Called when the Core Summary tool fails (e.g. rate limit).
+    Builds a minimal CoreSummary from the raw transcript so the report
+    still assembles instead of crashing with a 500.
+    """
+    # Grab first 120 chars of transcript as a rough one-liner
+    snippet = transcript.strip()[:120].replace("\n", " ")
+    one_line = snippet if snippet else "Summary unavailable — Core Summary tool failed"
+    return CoreSummary(
+        one_line       = one_line,
+        decisions_made = [],
+        next_steps     = ["Review transcript manually — AI summary tool hit rate limit"],
+        meeting_type   = "Unknown",
+    )
+
+
+async def run_agent_async(transcript: str, progress_callback=None) -> tuple[str, FullReport]:
+    """
+    Runs all 9 tools CONCURRENTLY using asyncio + ThreadPoolExecutor.
+    return_exceptions=True means one tool failure never crashes the whole report.
     """
 
-    print("[Agent] Starting analysis...")
+    def _notify(msg):
+        if progress_callback:
+            progress_callback(msg)
+        print(msg)
 
-    print("[Agent] Tool 1/9 — Core Summary")
-    summary = extract_core_summary(transcript)
+    _notify("[Agent] Starting — running all 9 tools in parallel...")
 
-    print("[Agent] Tool 2/9 — Action Items")
-    action_items = extract_action_items(transcript)
+    tasks = {
+        "summary":              _run_in_thread(extract_core_summary,         transcript),
+        "action_items":         _run_in_thread(extract_action_items,         transcript),
+        "financial_items":      _run_in_thread(extract_financial_items,      transcript),
+        "priorities":           _run_in_thread(extract_priorities,           transcript),
+        "commitments":          _run_in_thread(extract_commitments,          transcript),
+        "unresolved_questions": _run_in_thread(extract_unresolved_questions, transcript),
+        "people":               _run_in_thread(extract_people,               transcript),
+        "dates":                _run_in_thread(extract_dates,                transcript),
+        "risks":                _run_in_thread(extract_risks,                transcript),
+    }
 
-    print("[Agent] Tool 3/9 — Financial Items")
-    financial_items = extract_financial_items(transcript)
+    results = await asyncio.gather(
+        tasks["summary"],
+        tasks["action_items"],
+        tasks["financial_items"],
+        tasks["priorities"],
+        tasks["commitments"],
+        tasks["unresolved_questions"],
+        tasks["people"],
+        tasks["dates"],
+        tasks["risks"],
+        return_exceptions=True
+    )
 
-    print("[Agent] Tool 4/9 — Priorities")
-    priorities = extract_priorities(transcript)
+    (
+        summary,
+        action_items,
+        financial_items,
+        priorities,
+        commitments,
+        unresolved_questions,
+        people,
+        dates,
+        risks,
+    ) = results
 
-    print("[Agent] Tool 5/9 — Commitments")
-    commitments = extract_commitments(transcript)
+    # ── Graceful fallbacks ─────────────────────────────────────────────────────
+    # summary is the only required field in FullReport — must never be None.
+    # Everything else defaults to [] which Pydantic accepts fine.
 
-    print("[Agent] Tool 6/9 — Unresolved Questions")
-    unresolved_questions = extract_unresolved_questions(transcript)
+    if isinstance(summary, Exception):
+        _notify(f"[Agent] Warning: Core Summary failed — {summary}")
+        summary = _fallback_summary(transcript)   # ← safe CoreSummary, never None
 
-    print("[Agent] Tool 7/9 — People & Roles")
-    people = extract_people(transcript)
+    if isinstance(action_items, Exception):
+        _notify(f"[Agent] Warning: Action Items failed — {action_items}")
+        action_items = []
 
-    print("[Agent] Tool 8/9 — Dates & Deadlines")
-    dates = extract_dates(transcript)
+    if isinstance(financial_items, Exception):
+        _notify(f"[Agent] Warning: Financial Items failed — {financial_items}")
+        financial_items = []
 
-    print("[Agent] Tool 9/9 — Risks & Blockers")
-    risks = extract_risks(transcript)
+    if isinstance(priorities, Exception):
+        _notify(f"[Agent] Warning: Priorities failed — {priorities}")
+        priorities = []
 
-    print("[Agent] All tools complete — assembling report")
+    if isinstance(commitments, Exception):
+        _notify(f"[Agent] Warning: Commitments failed — {commitments}")
+        commitments = []
+
+    if isinstance(unresolved_questions, Exception):
+        _notify(f"[Agent] Warning: Unresolved Questions failed — {unresolved_questions}")
+        unresolved_questions = []
+
+    if isinstance(people, Exception):
+        _notify(f"[Agent] Warning: People failed — {people}")
+        people = []
+
+    if isinstance(dates, Exception):
+        _notify(f"[Agent] Warning: Dates failed — {dates}")
+        dates = []
+
+    if isinstance(risks, Exception):
+        _notify(f"[Agent] Warning: Risks failed — {risks}")
+        risks = []
+
+    _notify("[Agent] All tools complete — assembling report")
 
     report = FullReport(
         summary              = summary,
@@ -59,10 +141,28 @@ def run_agent(transcript: str) -> tuple[str, FullReport]:
         unresolved_questions = unresolved_questions,
         people               = people,
         dates_deadlines      = dates,
-        risks                = risks
+        risks                = risks,
     )
 
     report_id = str(uuid.uuid4())
-    print(f"[Agent] Report ready — ID: {report_id}")
+    _notify(f"[Agent] Report ready — ID: {report_id}")
 
     return report_id, report
+
+
+def run_agent(transcript: str, progress_callback=None) -> tuple[str, FullReport]:
+    """
+    Synchronous wrapper — call this from main.py exactly as before.
+    Handles both FastAPI (running event loop) and plain Python contexts.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor() as pool:
+            future = pool.submit(
+                asyncio.run,
+                run_agent_async(transcript, progress_callback)
+            )
+            return future.result()
+    except RuntimeError:
+        return asyncio.run(run_agent_async(transcript, progress_callback))
